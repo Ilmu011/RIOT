@@ -666,6 +666,7 @@ static void _isr_event_seq_tr(netdev_t *netdev, uint8_t *dregs)
         irqsts1 |= MKW2XDM_IRQSTS1_TXIRQ;
         if (dregs[MKW2XDM_PHY_CTRL1] & MKW2XDM_PHY_CTRL1_RXACKRQD) {
             DEBUG("[kw2xrf] wait for RX ACK\n");
+            DEBUG_PRINT("Starting timer 3 to detect ACK timeout\n");
             kw2xrf_timer3_seq_abort_on(dev);
             kw2xrf_abort_rx_ops_enable(dev, _MACACKWAITDURATION);
         }
@@ -698,6 +699,7 @@ static void _isr_event_seq_tr(netdev_t *netdev, uint8_t *dregs)
         if (dregs[MKW2XDM_IRQSTS3] & MKW2XDM_IRQSTS3_TMR3IRQ) {
             /* if the sequence was aborted by timer 3, ACK timed out */
             DEBUG("[kw2xrf] TC3TMOUT, SEQIRQ, TX failed\n");
+            DEBUG_PRINT("ACK TIMEOUT\n");
             irqsts1 |= MKW2XDM_IRQSTS1_SEQIRQ;
             assert(dev->pending_tx != 0);
             dev->pending_tx--;
@@ -707,6 +709,7 @@ static void _isr_event_seq_tr(netdev_t *netdev, uint8_t *dregs)
             kw2xrf_set_sequence(dev, dev->idle_state);
         } else {
             DEBUG("[kw2xrf] SEQIRQ\n");
+            DEBUG_PRINT("ACK RECEIVE\n");
             irqsts1 |= MKW2XDM_IRQSTS1_SEQIRQ;
             assert(dev->pending_tx != 0);
             dev->pending_tx--;
