@@ -88,20 +88,14 @@ extern "C" {
 #define KW2XRF_OPT_RAWDUMP          (NETDEV_IEEE802154_RAW)            /**< legacy define */
 #define KW2XRF_OPT_ACK_REQ          (NETDEV_IEEE802154_ACK_REQ)        /**< legacy define */
 
-#define KW2XRF_OPT_AUTOCCA          (0x0100)    /**< CCA befor TX active */
-#define KW2XRF_OPT_PROMISCUOUS      (0x0200)    /**< promiscuous mode
-                                                  *   active */
+#define KW2XRF_OPT_CSMA             (0x0100)    /**< use CSMA/CA algorithm for sending */
+#define KW2XRF_OPT_PROMISCUOUS      (0x0200)    /**< promiscuous mode active */
 #define KW2XRF_OPT_PRELOADING       (0x0400)    /**< preloading enabled */
-#define KW2XRF_OPT_TELL_TX_START    (0x0800)    /**< notify MAC layer on TX
-                                                  *   start */
-#define KW2XRF_OPT_TELL_TX_END      (0x1000)    /**< notify MAC layer on TX
-                                                  *   finished */
-#define KW2XRF_OPT_TELL_RX_START    (0x2000)    /**< notify MAC layer on RX
-                                                  *   start */
-#define KW2XRF_OPT_TELL_RX_END      (0x4000)    /**< notify MAC layer on RX
-                                                  *   finished */
-#define KW2XRF_OPT_AUTOACK          (0x8000)    /**< enable automatically ACK
-                                                  *   for incommint packet */
+#define KW2XRF_OPT_TELL_TX_START    (0x0800)    /**< notify MAC layer on TX start */
+#define KW2XRF_OPT_TELL_TX_END      (0x1000)    /**< notify MAC layer on TX finished */
+#define KW2XRF_OPT_TELL_RX_START    (0x2000)    /**< notify MAC layer on RX start */
+#define KW2XRF_OPT_TELL_RX_END      (0x4000)    /**< notify MAC layer on RX finished */
+#define KW2XRF_OPT_AUTOACK          (0x8000)    /**< enable automatic ACK for incoming packet */
 /** @} */
 
 /**
@@ -135,6 +129,16 @@ typedef struct {
                                              this is required to know when to
                                              return to @ref kw2xrf_t::idle_state */
     int16_t tx_power;                   /**< The current tx-power setting of the device */
+
+                                        /**  -----------------Internal CSMA algorithm parameters-----------------*/
+    uint8_t csma_min_be;                /**< Minimum backoff exponent (macMinBe) */
+    uint8_t csma_max_be;                /**< Maximum backoff exponent (macMaxBe) */
+    uint8_t csma_be;                    /**< CSMA backoff exponent in the current transmission attempt */
+    uint32_t csma_delay;                /**< The actual delay for the CSMA algorithm */
+
+                                        /**  -----------------Internal counters-----------------*/
+    uint8_t num_backoffs;               /**< Number of CSMA backoffs so far in the current transmission attempt */
+    uint8_t max_backoffs;               /**< Maximum number of CSMA backoffs when waiting for channel clear (macMaxCsmaBackoffs) */
     /** @} */
 } kw2xrf_t;
 

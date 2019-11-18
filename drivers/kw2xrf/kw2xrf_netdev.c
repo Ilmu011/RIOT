@@ -18,13 +18,18 @@
  * @author      Johann Fischer  <j.fischer@phytec.de>
  * @author      Peter Kietzmann <peter.kietzmann@haw-hamburg.de>
  * @author      Joakim Nohlgård <joakim.nohlgard@eistec.se>
+ * @author      Adem-Can Agdas  <adem-can.agdas@haw-hamburg.de>
  */
+
+// >>< TODO: Complete DEBUG messages
+// >>< TODO: Code conventions
 
 #include <string.h>
 #include <assert.h>
 #include <errno.h>
 
 #include "log.h"
+#include "random.h"
 #include "thread_flags.h"
 #include "net/eui64.h"
 #include "net/ieee802154.h"
@@ -43,6 +48,7 @@
 #include "debug.h"
 
 #define _MACACKWAITDURATION         (864 / 16) /* 864us * 62500Hz */
+#define KW2XRF_CSMA_UNIT_TIME       20	//320 us
 
 #define KW2XRF_THREAD_FLAG_ISR      (1 << 8)
 
@@ -95,14 +101,45 @@ static size_t kw2xrf_tx_load(uint8_t *pkt_buf, uint8_t *buf, size_t len, size_t 
     return offset + len;
 }
 
+/**
+ * @brief Generate a random number for using as a CSMA delay value
+ */
+static inline uint32_t kw2xrf_csma_random_delay(kw2xrf_t *dev)
+{
+    /* Use topmost csma_be bits of the random number */
+    uint32_t rnd = random_uint32() >> (32 - dev->csma_be);
+    return (rnd * KW2XRF_CSMA_UNIT_TIME);
+}
+
 static void kw2xrf_tx_exec(kw2xrf_t *dev)
 {
-    if ((dev->netdev.flags & KW2XRF_OPT_ACK_REQ) &&
-        (_send_last_fcf & IEEE802154_FCF_ACK_REQ)) {
+    kw2xrf_set_sequence(dev, XCVSEQ_IDLE);
+
+    bool transmit_with_receive = ((dev->netdev.flags & KW2XRF_OPT_ACK_REQ) &&
+        (_send_last_fcf & IEEE802154_FCF_ACK_REQ));
+    bool csma_requested = (dev->netdev.flags & KW2XRF_OPT_CSMA);
+
+    if(csma_requested)
+    {
+        /* Allow TMR2 interrupt to schedule a TX operation */
+        /* This MUST be done BEFORE the sequence has been written to XCVSEQ, otherwise it will be executed immediately */
+        /* For more info check the Reference Manual */
+        /* Chapter 7.7.3 Using T2CMP to Trigger Transceiver Operations*/
+        kw2xrf_timer2_seq_start_on(dev);
+    }
+
+    if (transmit_with_receive) {
         kw2xrf_set_sequence(dev, XCVSEQ_TX_RX);
     }
     else {
         kw2xrf_set_sequence(dev, XCVSEQ_TRANSMIT);
+    }
+
+    if(csma_requested)
+    {
+        /* Enable TMR2 interrupt and set timeout for TMR2 */
+        /* This should be done after the sequence has been written to XCVSEQ */
+        kw2xrf_trigger_tx_ops_enable(dev, dev->csma_delay);
     }
 }
 
@@ -152,7 +189,6 @@ static int _send(netdev_t *netdev, const iolist_t *iolist)
         len = kw2xrf_tx_load(pkt_buf, iol->iol_base, iol->iol_len, len);
     }
 
-    kw2xrf_set_sequence(dev, XCVSEQ_IDLE);
     dev->pending_tx++;
 
     /*
@@ -168,6 +204,10 @@ static int _send(netdev_t *netdev, const iolist_t *iolist)
 
     /* send data out directly if pre-loading id disabled */
     if (!(dev->netdev.flags & KW2XRF_OPT_PRELOADING)) {
+        /* New transmission! Reset the CSMA counters */
+        dev->csma_be = dev->csma_min_be;
+        dev->num_backoffs = 0;
+        dev->csma_delay = kw2xrf_csma_random_delay(dev);
         kw2xrf_tx_exec(dev);
     }
 
@@ -315,10 +355,31 @@ int _get(netdev_t *netdev, netopt_t opt, void *value, size_t len)
                 !!(dev->netdev.flags & KW2XRF_OPT_TELL_TX_END);
             return sizeof(netopt_enable_t);
 
-        case NETOPT_AUTOCCA:
+        case NETOPT_CSMA:
             *((netopt_enable_t *)value) =
-                !!(dev->netdev.flags & KW2XRF_OPT_AUTOCCA);
+                !!(dev->netdev.flags & KW2XRF_OPT_CSMA);
             return sizeof(netopt_enable_t);
+
+        case NETOPT_CSMA_RETRIES:
+            if (len != sizeof(uint8_t)) {
+                return -EOVERFLOW;
+            }
+            *((uint8_t *)value) = dev->max_backoffs;
+            return len;
+
+        case NETOPT_CSMA_MAXBE:
+            if (len != sizeof(uint8_t)) {
+                return -EOVERFLOW;
+            }
+            *((uint8_t *)value) = dev->csma_max_be;
+            return len;
+
+        case NETOPT_CSMA_MINBE:
+            if (len != sizeof(uint8_t)) {
+                return -EOVERFLOW;
+            }
+            *((uint8_t *)value) = dev->csma_min_be;
+            return len;
 
         case NETOPT_CHANNEL:
             if (len < sizeof(uint16_t)) {
@@ -503,11 +564,37 @@ static int _set(netdev_t *netdev, netopt_t opt, const void *value, size_t len)
                                  ((bool *)value)[0]);
             res = sizeof(netopt_enable_t);
             break;
-
-        case NETOPT_AUTOCCA:
-            kw2xrf_set_option(dev, KW2XRF_OPT_AUTOCCA,
+        case NETOPT_CSMA:
+            kw2xrf_set_option(dev, KW2XRF_OPT_CSMA,
                                  ((bool *)value)[0]);
             res = sizeof(netopt_enable_t);
+            break;
+
+        case NETOPT_CSMA_RETRIES:
+            if (len != sizeof(uint8_t)) {
+                res = -EOVERFLOW;
+                break;
+            }
+            dev->max_backoffs = *((const uint8_t*)value);
+            res = len;
+            break;
+
+        case NETOPT_CSMA_MAXBE:
+            if (len != sizeof(uint8_t)) {
+                res = -EOVERFLOW;
+                break;
+            }
+            dev->csma_max_be = *((const uint8_t*)value);
+            res = len;
+            break;
+
+        case NETOPT_CSMA_MINBE:
+            if (len != sizeof(uint8_t)) {
+                res = -EOVERFLOW;
+                break;
+            }
+            dev->csma_min_be = *((const uint8_t*)value);
+            res = len;
             break;
 
         case NETOPT_CCA_THRESHOLD:
@@ -614,21 +701,55 @@ static void _isr_event_seq_t(netdev_t *netdev, uint8_t *dregs)
     if (dregs[MKW2XDM_IRQSTS1] & MKW2XDM_IRQSTS1_SEQIRQ) {
         DEBUG("[kw2xrf] SEQIRQ\n");
         irqsts1 |= MKW2XDM_IRQSTS1_SEQIRQ;
+        bool retransmission_issued = false;
 
         if (dregs[MKW2XDM_IRQSTS1] & MKW2XDM_IRQSTS1_CCAIRQ) {
             irqsts1 |= MKW2XDM_IRQSTS1_CCAIRQ;
+
             if (dregs[MKW2XDM_IRQSTS2] & MKW2XDM_IRQSTS2_CCA) {
                 DEBUG("[kw2xrf] CCA CH busy\n");
-                netdev->event_callback(netdev, NETDEV_EVENT_TX_MEDIUM_BUSY);
+                /* Channel busy: Try CSMA backoff */
+                /* Info: The fact, that a CCA was performed here, means that NETOPT_CSMA was set before, so we don't have to check that */
+                /* Limit reached ? */
+                if(dev->num_backoffs < dev->max_backoffs)
+                {
+                    /* Limit for retransmissions hasn't been reached yet: try again! */
+                    dev->num_backoffs++;
+                    if(dev->csma_be < dev->csma_max_be)
+                    {
+                        dev->csma_be++;
+                    }
+                    dev->csma_delay = kw2xrf_csma_random_delay(dev);
+                    kw2xrf_tx_exec(dev);
+                    retransmission_issued = true;
+                }
+                else
+                {
+                    /* Limit for retransmissions reached: give up */
+                    netdev->event_callback(netdev, NETDEV_EVENT_TX_MEDIUM_BUSY);
+                }
             }
             else {
                 netdev->event_callback(netdev, NETDEV_EVENT_TX_COMPLETE);
             }
         }
 
-        assert(dev->pending_tx != 0);
-        dev->pending_tx--;
-        kw2xrf_set_idle_sequence(dev);
+        if(!retransmission_issued)
+        {
+            /* If a retransmission was issued, that means we're not done yet! */
+            assert(dev->pending_tx != 0);
+            dev->pending_tx--;
+            kw2xrf_set_idle_sequence(dev);
+        }
+    }
+
+    if (dregs[MKW2XDM_IRQSTS3] & MKW2XDM_IRQSTS3_TMR2IRQ) {
+        /* TMR2 interrupt means a TX operation that was scheduled by TMR2 has been executed */
+
+        /* Disallow TMR2 interrupt to schedule a TX operation */
+        kw2xrf_timer2_seq_start_off(dev);
+        /* Disable TMR2 interrupt and reset TMR2IRQ */
+        kw2xrf_trigger_tx_ops_disable(dev);
     }
 
     kw2xrf_write_dreg(dev, MKW2XDM_IRQSTS1, irqsts1);
@@ -689,17 +810,36 @@ static void _isr_event_seq_tr(netdev_t *netdev, uint8_t *dregs)
     }
 
     if (dregs[MKW2XDM_IRQSTS1] & MKW2XDM_IRQSTS1_SEQIRQ) {
+        DEBUG("[kw2xrf] SEQIRQ\n");
+        irqsts1 |= MKW2XDM_IRQSTS1_SEQIRQ;
+        bool retry_issued = false;
+
         if (dregs[MKW2XDM_IRQSTS1] & MKW2XDM_IRQSTS1_CCAIRQ) {
             irqsts1 |= MKW2XDM_IRQSTS1_CCAIRQ;
             if (dregs[MKW2XDM_IRQSTS2] & MKW2XDM_IRQSTS2_CCA) {
                 DEBUG("[kw2xrf] CCA CH busy\n");
-                netdev->event_callback(netdev, NETDEV_EVENT_TX_MEDIUM_BUSY);
+                /* Channel busy: Try CSMA backoff */
+                /* Info: The fact, that a CCA was performed here, means that NETOPT_CSMA was set before, so we don't have to check that */
+                /* Limit reached ? */
+                if(dev->num_backoffs < dev->max_backoffs)
+                {
+                    /* Limit for backoffs hasn't been reached yet: try again! */
+                    dev->num_backoffs++;
+                    if(dev->csma_be < dev->csma_max_be)
+                    {
+                        dev->csma_be++;
+                    }
+                    dev->csma_delay = kw2xrf_csma_random_delay(dev);
+                    kw2xrf_tx_exec(dev);
+                    retry_issued = true;
+                }
+                else
+                {
+                    /* Limit for retransmissions reached: give up */
+                    netdev->event_callback(netdev, NETDEV_EVENT_TX_MEDIUM_BUSY);
+                }
             }
         }
-
-        irqsts1 |= MKW2XDM_IRQSTS1_SEQIRQ;
-        assert(dev->pending_tx != 0);
-        dev->pending_tx--;
 
         if (dregs[MKW2XDM_IRQSTS3] & MKW2XDM_IRQSTS3_TMR3IRQ) {
             /* if the sequence was aborted by timer 3, ACK timed out */
@@ -714,8 +854,23 @@ static void _isr_event_seq_tr(netdev_t *netdev, uint8_t *dregs)
         kw2xrf_timer3_seq_abort_off(dev);
         /* Disable interrupt for TMR3 and reset TMR3IRQ */
         kw2xrf_abort_rx_ops_disable(dev);
-        /* Go back to idle state */
-        kw2xrf_set_idle_sequence(dev);
+
+        if(!retry_issued)
+        {
+            /* If a retry was issued, that means we're not done yet! */
+            assert(dev->pending_tx != 0);
+            dev->pending_tx--;
+            kw2xrf_set_idle_sequence(dev);
+        }
+    }
+
+    if (dregs[MKW2XDM_IRQSTS3] & MKW2XDM_IRQSTS3_TMR2IRQ) {
+        /* TMR2 interrupt means a TX operation that was scheduled by TMR2 has been executed */
+
+        /* Disallow TMR2 interrupt to schedule a TX operation */
+        kw2xrf_timer2_seq_start_off(dev);
+        /* Disable TMR2 interrupt and reset TMR2IRQ */
+        kw2xrf_trigger_tx_ops_disable(dev);
     }
 
     kw2xrf_write_dreg(dev, MKW2XDM_IRQSTS1, irqsts1);
